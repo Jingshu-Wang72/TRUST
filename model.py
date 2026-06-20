@@ -51,9 +51,6 @@ class TRUST(nn.Module):
         top_k: int = 5,
         use_pseudo: bool = True,
         use_pseudo_in_fusion: bool = True,
-        min_warmup_epochs: int = 5,
-        stable_topk_steps: int = 3,
-        max_warmup_epochs: int = 40,
     ) -> None:
         super().__init__()
         hidden = hidden or [128, 64]
@@ -63,9 +60,6 @@ class TRUST(nn.Module):
         self.top_k = min(int(top_k), self.n_views)
         self.use_pseudo = bool(use_pseudo)
         self.use_pseudo_in_fusion = bool(use_pseudo_in_fusion)
-        self.min_warmup_epochs = int(min_warmup_epochs)
-        self.stable_topk_steps = int(stable_topk_steps)
-        self.max_warmup_epochs = int(max_warmup_epochs)
 
         self.projections = nn.ModuleList([
             nn.Sequential(nn.BatchNorm1d(dim), nn.Linear(dim, FUSED_FEATURE_DIM), nn.ReLU())
@@ -83,11 +77,7 @@ class TRUST(nn.Module):
         # Every base view, including MiniROCKET/MultiROCKET/HYDRA, uses this same evidence DNN.
         self.pseudo_branch = MLPBranch(FUSED_FEATURE_DIM, hidden, self.n_classes)
 
-        self.selected_views: list[int] | None = None
         self.selected_view_counts: list[int] = [0 for _ in range(self.n_views)]
-        self.selection_step = 0
-        self.stable_count = 0
-        self.warmup_complete = False
 
     @staticmethod
     def sign_sqrt_l2(x: torch.Tensor) -> torch.Tensor:
@@ -133,21 +123,6 @@ class TRUST(nn.Module):
             fused = self.ds_combine_two(fused, alphas[:, idx, :])
         return fused
 
-    def update_selected_views(self, uncertainties: torch.Tensor, epoch: int) -> list[int]:
-        current = torch.topk(uncertainties, k=self.top_k, largest=False).indices.tolist()
-        self.selection_step += 1
-        if self.selected_views == current:
-            self.stable_count += 1
-        else:
-            self.stable_count = 1
-            self.selected_views = list(current)
-
-        if epoch >= self.max_warmup_epochs:
-            self.warmup_complete = True
-        if epoch >= self.min_warmup_epochs and self.stable_count >= self.stable_topk_steps:
-            self.warmup_complete = True
-        return current
-
     def forward(
         self,
         views: list[torch.Tensor],
@@ -164,7 +139,6 @@ class TRUST(nn.Module):
         alpha_stack = torch.stack(view_alphas, dim=1)
         uncertainties = self.n_classes / torch.sum(alpha_stack, dim=2)
         selected = torch.topk(uncertainties, k=self.top_k, dim=1, largest=False).indices
-        self.selected_views = None
         counts = torch.bincount(selected.detach().reshape(-1).cpu(), minlength=self.n_views)
         self.selected_view_counts = counts.tolist()
 

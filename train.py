@@ -89,9 +89,6 @@ def train_one(args: argparse.Namespace) -> dict[str, float | str | int]:
         top_k=args.top_k,
         use_pseudo=not args.no_pseudo,
         use_pseudo_in_fusion=not args.no_pseudo_in_fusion,
-        min_warmup_epochs=args.min_warmup_epochs,
-        stable_topk_steps=args.stable_topk_steps,
-        max_warmup_epochs=args.max_warmup_epochs,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -181,9 +178,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
     parser.add_argument("--annealing_epoch", type=int, default=20)
-    parser.add_argument("--min_warmup_epochs", type=int, default=5)
-    parser.add_argument("--stable_topk_steps", type=int, default=3)
-    parser.add_argument("--max_warmup_epochs", type=int, default=40)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--no_pseudo", action="store_true")
