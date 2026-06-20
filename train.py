@@ -21,6 +21,11 @@ def collate_views(batch):
     return views, torch.stack(targets, dim=0)
 
 
+def format_selected_view_counts(view_names: list[str], counts: list[int]) -> str:
+    selected = [f"{name}:{count}" for name, count in zip(view_names, counts) if count > 0]
+    return "|".join(selected)
+
+
 @torch.no_grad()
 def evaluate(model: TRUST, loader: DataLoader, device: torch.device, epoch: int) -> dict[str, float]:
     model.eval()
@@ -29,7 +34,7 @@ def evaluate(model: TRUST, loader: DataLoader, device: torch.device, epoch: int)
     for views, target in loader:
         views = [view.to(device) for view in views]
         target = target.to(device)
-        _, fused_alpha = model(views, epoch=epoch)
+        _, _, fused_alpha = model(views, epoch=epoch)
         losses.append(float(evidential_ce_loss(target, fused_alpha, model.n_classes, epoch, 1).item()))
         pred = torch.argmax(fused_alpha, dim=1)
         y_true.extend(target.cpu().numpy().tolist())
@@ -89,6 +94,12 @@ def train_one(args: argparse.Namespace) -> dict[str, float | str | int]:
         max_warmup_epochs=args.max_warmup_epochs,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=20,
+    )
 
     ensure_dir(args.output_dir)
     history_path = os.path.join(args.output_dir, "history.csv")
@@ -103,8 +114,10 @@ def train_one(args: argparse.Namespace) -> dict[str, float | str | int]:
                 views = [view.to(device) for view in views]
                 target = target.to(device)
                 optimizer.zero_grad(set_to_none=True)
-                view_alphas, fused_alpha = model(views, epoch=epoch)
+                view_alphas, pseudo_alpha, fused_alpha = model(views, epoch=epoch)
                 losses = [evidential_ce_loss(target, alpha, model.n_classes, epoch, args.annealing_epoch) for alpha in view_alphas]
+                if pseudo_alpha is not None:
+                    losses.append(evidential_ce_loss(target, pseudo_alpha, model.n_classes, epoch, args.annealing_epoch))
                 losses.append(evidential_ce_loss(target, fused_alpha, model.n_classes, epoch, args.annealing_epoch))
                 loss = torch.stack(losses).mean()
                 loss.backward()
@@ -112,10 +125,12 @@ def train_one(args: argparse.Namespace) -> dict[str, float | str | int]:
                 train_losses.append(float(loss.item()))
                 progress.set_postfix(loss=f"{np.mean(train_losses):.4f}")
 
-            selected = "|".join(view_names[i] for i in (model.selected_views or []))
+            train_loss = float(np.mean(train_losses))
+            scheduler.step(train_loss)
+            selected = format_selected_view_counts(view_names, model.selected_view_counts)
             writer.writerow({
                 "epoch": epoch,
-                "train_loss": f"{np.mean(train_losses):.6f}",
+                "train_loss": f"{train_loss:.6f}",
                 "selected_views": selected,
             })
             handle.flush()
@@ -138,7 +153,7 @@ def train_one(args: argparse.Namespace) -> dict[str, float | str | int]:
         "resample_id": int(args.resample_id),
         "epoch": int(args.epochs),
         "test_acc": float(final_metrics["acc"]),
-        "selected_views": "|".join(view_names[i] for i in (model.selected_views or [])),
+        "selected_views": format_selected_view_counts(view_names, model.selected_view_counts),
     }
 
 

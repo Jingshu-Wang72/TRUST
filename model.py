@@ -84,6 +84,7 @@ class TRUST(nn.Module):
         self.pseudo_branch = MLPBranch(FUSED_FEATURE_DIM, hidden, self.n_classes)
 
         self.selected_views: list[int] | None = None
+        self.selected_view_counts: list[int] = [0 for _ in range(self.n_views)]
         self.selection_step = 0
         self.stable_count = 0
         self.warmup_complete = False
@@ -124,6 +125,14 @@ class TRUST(nn.Module):
             fused = self.ds_combine_two(fused, alpha)
         return fused
 
+    def ds_combine_samplewise(self, alphas: torch.Tensor) -> torch.Tensor:
+        if alphas.ndim != 3 or alphas.shape[1] < 1:
+            raise ValueError("Expected alpha tensor with shape [batch, views, classes].")
+        fused = alphas[:, 0, :]
+        for idx in range(1, alphas.shape[1]):
+            fused = self.ds_combine_two(fused, alphas[:, idx, :])
+        return fused
+
     def update_selected_views(self, uncertainties: torch.Tensor, epoch: int) -> list[int]:
         current = torch.topk(uncertainties, k=self.top_k, largest=False).indices.tolist()
         self.selection_step += 1
@@ -139,7 +148,11 @@ class TRUST(nn.Module):
             self.warmup_complete = True
         return current
 
-    def forward(self, views: list[torch.Tensor], epoch: int | None = None) -> tuple[list[torch.Tensor], torch.Tensor]:
+    def forward(
+        self,
+        views: list[torch.Tensor],
+        epoch: int | None = None,
+    ) -> tuple[list[torch.Tensor], torch.Tensor | None, torch.Tensor]:
         if len(views) != self.n_views:
             raise ValueError(f"Expected {self.n_views} views, got {len(views)}")
 
@@ -148,21 +161,17 @@ class TRUST(nn.Module):
         view_logits = [branch(view) for branch, view in zip(self.view_branches, enhanced)]
         view_alphas = [F.softplus(logit) + 1.0 for logit in view_logits]
 
-        uncertainties = torch.stack([
-            torch.mean(self.n_classes / torch.sum(alpha, dim=1)) for alpha in view_alphas
-        ])
+        alpha_stack = torch.stack(view_alphas, dim=1)
+        uncertainties = self.n_classes / torch.sum(alpha_stack, dim=2)
+        selected = torch.topk(uncertainties, k=self.top_k, dim=1, largest=False).indices
+        self.selected_views = None
+        counts = torch.bincount(selected.detach().reshape(-1).cpu(), minlength=self.n_views)
+        self.selected_view_counts = counts.tolist()
 
-        if self.training and epoch is not None:
-            self.update_selected_views(uncertainties.detach(), epoch)
-
-        if not self.warmup_complete or self.selected_views is None:
-            selected = list(range(self.n_views))
-        else:
-            selected = list(self.selected_views)
-
-        fusion_alphas = [view_alphas[idx] for idx in selected]
-        if pseudo is not None and self.use_pseudo_in_fusion:
-            pseudo_alpha = F.softplus(self.pseudo_branch(pseudo)) + 1.0
-            fusion_alphas.append(pseudo_alpha)
-        fused_alpha = self.ds_combine(fusion_alphas)
-        return view_alphas, fused_alpha
+        gather_idx = selected.unsqueeze(-1).expand(-1, -1, self.n_classes)
+        fusion_alphas = alpha_stack.gather(dim=1, index=gather_idx)
+        pseudo_alpha = F.softplus(self.pseudo_branch(pseudo)) + 1.0 if pseudo is not None else None
+        if pseudo_alpha is not None and self.use_pseudo_in_fusion:
+            fusion_alphas = torch.cat([fusion_alphas, pseudo_alpha.unsqueeze(1)], dim=1)
+        fused_alpha = self.ds_combine_samplewise(fusion_alphas)
+        return view_alphas, pseudo_alpha, fused_alpha
